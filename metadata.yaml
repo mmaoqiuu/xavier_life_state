@@ -1,0 +1,7 @@
+name: xavier_life_state
+display_name: 兔的一天
+desc: 沈星回的动态生活状态流系统：让陪伴拥有真实流动的呼吸感
+short_desc: 角色也有属于自己的一天
+version: v1.1.0
+author: mmq
+repo: "https://github.com/mmaoqiuu/xavier_life_state"

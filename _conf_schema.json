@@ -1,0 +1,142 @@
+{
+  "session_list_mode": {
+    "type": "string",
+    "description": "会话名单模式",
+    "hint": "whitelist=仅列表中的会话启用；blacklist=列表中的会话不启用；none=所有会话启用。",
+    "options": [
+      "whitelist",
+      "blacklist",
+      "none"
+    ],
+    "default": "whitelist"
+  },
+  "session_list": {
+    "type": "list",
+    "description": "会话名单列表",
+    "hint": "需填写完整 UMO（如 default:GroupMessage:123456）。可通过 /sid 获取。",
+    "items": {
+      "type": "string"
+    },
+    "default": []
+  },
+  "history_reference_days": {
+    "type": "int",
+    "description": "历史状态参考天数",
+    "hint": "生成时可参考的最近成功历史状态数量。设为 0 时不参考历史日程。",
+    "slider": {
+      "min": 0,
+      "max": 7,
+      "step": 1
+    },
+    "default": 3
+  },
+  "llm_provider_id": {
+    "type": "string",
+    "description": "状态生成 LLM 模型 ID",
+    "hint": "用于生成动态生活状态的 LLM Provider。留空则使用当前默认模型。",
+    "_special": "select_provider",
+    "default": ""
+  },
+  "llm_temperature": {
+    "type": "float",
+    "description": "生成温度（0.0 ~ 2.0）",
+    "hint": "越高日程越随机、越不一样；越低越稳定、越贴近日程表。推荐 1.2 ~ 1.5 增加多样性。部分 provider 可能忽略此值。",
+    "slider": {
+      "min": 0.0,
+      "max": 2.0,
+      "step": 0.1
+    },
+    "default": 1.0
+  },
+  "extra_randomness": {
+    "type": "bool",
+    "description": "额外随机性提示",
+    "hint": "开启后在提示词末尾追加「避免与历史重复、尽量变化」的软约束，进一步拉开每日差异。",
+    "default": true
+  },
+  "day_mood_enable": {
+    "type": "bool",
+    "description": "启用每日基调随机",
+    "hint": "生成前随机抽一条今日基调，塞进提示词，压制人格里固定作息表的影响。",
+    "default": true
+  },
+  "day_mood_pool": {
+    "type": "list",
+    "description": "每日基调池",
+    "hint": "生成时随机抽一条。留空则用内置默认。想更贴合角色就自己改。",
+    "items": {
+      "type": "string"
+    },
+    "default": [
+      "今天状态很好，精力充沛，想多做点事",
+      "今天有点懒散，大部分时间在放空和休息",
+      "今天心思在别处，日程尽量简单",
+      "今天临时起意出门，日程和平时不太一样",
+      "今天在家宅着，活动半径很小",
+      "今天被杂事推着走，没有自己的安排",
+      "今天难得清闲，想慢慢做一件喜欢的事",
+      "今天情绪不太稳，忽冷忽热",
+      "今天特别想见人，主动约了朋友",
+      "今天什么都不想做，只想躺着",
+      "今天心血来潮，去了一趟平时不常去的地方",
+      "今天在处理一件拖了很久的事",
+      "今天被朋友临时叫出门，打乱了原计划",
+      "今天一整天都在沉迷一件事，忘了时间"
+    ]
+  },
+  "persona_id": {
+    "type": "string",
+    "description": "人格设定 ID",
+    "hint": "用于生成动态生活状态的人格设定。留空则使用当前默认人设。",
+    "_special": "select_persona",
+    "default": ""
+  },
+  "injection_mode": {
+    "type": "string",
+    "description": "状态注入方式",
+    "hint": "extra_user_content_parts: 使用临时用户附加上下文，推荐；fake_tool_call: 伪造工具调用注入到对话历史",
+    "options": [
+      "extra_user_content_parts",
+      "fake_tool_call"
+    ],
+    "default": "extra_user_content_parts"
+  },
+  "prompt_template": {
+    "type": "text",
+    "description": "状态生成提示词模板",
+    "hint": "可用占位符：{date}、{day_mood}、{holiday}、{persona}、{history_states}、{extra_requirements}、{timeline_optional_fields}。",
+    "editor_mode": true,
+    "editor_language": "markdown",
+    "default": "请根据角色设定，生成该角色在指定日期内的动态生活状态。\n\n日期：{date}\n今日基调：{day_mood}（今天的具体情况，可能和平时的作息不一样，请优先按这个基调展开）\n节日：{holiday}\n状态范围：当天 00:00（含）至次日 00:00（不含）。所有时段均按日期 {date} 当天解释。\n当前时间：{current_time}\n\n{locked_section}\n\n角色设定：\n{persona}\n\n强制约束：\n\n1. 只输出一个可被 JSON 解析的对象，不要输出 Markdown、解释、注释或多余文本。\n2. 顶层必须包含 date、schedule_summary、style_summary、timeline 三个字段。date 必须严格等于 \"{date}\"。\n3. timeline 至少包含 3 个时间段，每个时间段中必须包含 time、schedule 两个字段。\n4. timeline 中的每一项可以按需添加以下可选字段：{timeline_optional_fields}。\n5. time 可以使用 \"凌晨\"、\"早上\"、\"上午\"、\"中午\"、\"下午\"、\"傍晚\"、\"晚上\"、\"深夜\" 这类自然时段，也可以使用 \"08:00-09:00\"、\"23:00-01:00\" 这类具体时间区间。\n6. 跨午夜具体区间只保留当前日期内午夜前的部分。例如 \"23:00-01:00\" 在本状态中仅表示 23:00-24:00。\n7. 【重要】不要输出 outfit、服装、穿搭等字段。本状态不涉及穿搭。\n8. 【重要】日程表只是角色平时的大致节奏，不是每天必须遵守的铁律。请以「今日基调」为准，让今天的日程和平时有明显区别。\n9. 【重要】每个时段必须输出 emoji 字段，让人一眼看出这个时段在做什么。按下面的优先级选：\n   ① 优先挑能代表具体人事物的符号：\n      看书漫画 📖 / 打游戏 🎮 / 钓鱼 🎣 / 用电脑 💻 / 听歌 🎧 / 刷手机 📱 / 上班工作 💼 /\n      吃喝 🍜🍕🍔🥘🍣☕（按具体吃什么喝什么挑一个）/ 逛店购物 🛒 / 洗漱 🚿 / 睡觉 💤 /\n      节日 🎆 烟火庆典 / 🌕 圆月 / 🧧 红封 / 🏮 花灯 / 🎏 彩旗 / 🎄 常青树 / 🎃 南瓜灯 / 💝 心意 / 🥮 节令点心（按节日性质自行挑一个，别硬套）\n   ② 这几种都对应不上时，才用氛围符号：\n      🫧 放空发呆 / 💭 出神神游 / 💡 动脑专注 / 🐾 出门闲逛 / 🛁 泡澡放松 /\n      🧸 蜷着放软 / 💕 温柔想念 / ✨ 心情明亮 / 🌟 兴致高涨 / ✌️ 轻松搞定 /\n      💫 走神发晕 / 🪤 暗中使坏\n   只准用上面列出的符号，不要用表情脸（😊🙂😔 这类）；同一份日程里相邻时段不要重复同一个符号。\n\n10. 【重要】节日联动：「节日」不是「无」时，必须让当天日程自然融入这个节日的习俗、气氛或它带来的生活变化，并让对应时段的 emoji 呼应节日。具体怎么过由你结合角色设定自行发挥，只要合乎节日性质即可；不要把节日写成一句干巴巴的标签，也不要套用千篇一律的节日清单。「节日」为「无」时按平日节奏即可，禁止凭空编造节日。\n\n时段参考映射（左闭右开）：\n\n凌晨：00:00-06:00\n早上：06:00-09:00\n上午：09:00-12:00\n中午：12:00-14:00\n下午：14:00-18:00\n傍晚：18:00-20:00\n晚上：20:00-23:00\n深夜：23:00-24:00\n\n生成要求：\n\n1. 内容应符合角色设定，不要与角色身份、性格、生活方式明显冲突；日程保持简洁自然，不要过度夸张。\n2. 生成结果总体上应体现当天不同时间段生活状态的流动感，但不要描述变化过程。\n3. 【重要】时段之间要有现实连贯的动线，两头都要防：\n   ① 不要每换一个时段就换一个地方。相邻时段还在同一地点时自然承接下去，只换侧重、不换场景，\n      例如：上午在河边垂钓 → 中午就在同一片岸边树荫下用餐歇息 → 下午继续在原地安安静静钓鱼。\n   ② 但也不许一整天粘在同一处不动。全天应当出现 3-5 个地点，在合理节点自然移动：\n      比如吃完饭换个地方、天色转暗该回去了、顺路去买点东西、该回家休息。\n   ③ 移动必须符合现实动线（通勤、顺路、返程），禁止在城市两端来回跳跃，也不要为凑时间线凭空多加地点。\n   ④ 判断标准：读下来像一个人真实的一天，而不是「原地待命」或「打卡跳点」。\n4. schedule 字段描述该时间段正在进行或持续的生活状态，保持简洁自然，无需过渡说明。\n\n输出格式必须类似下面的 JSON：\n\n{\n\"date\": \"{date}\",\n\"schedule_summary\": \"当天整体日程的简短描述\",\n\"style_summary\": \"当天整体氛围的简短描述\",\n\"timeline\": [\n{\n\"time\": \"上午\",\n\"schedule\": \"这个时间段正在做的事情\",\n\"mood\": \"闲适\",\n\"emoji\": \"📖\"\n},\n{\n\"time\": \"下午\",\n\"schedule\": \"这个时间段正在做的事情\",\n\"mood\": \"专注\",\n\"emoji\": \"🎣\"\n},\n{\n\"time\": \"晚上\",\n\"schedule\": \"这个时间段正在做的事情\",\n\"mood\": \"慵懒\",\n\"emoji\": \"🎮\"\n}\n]\n}\n\n历史状态：\n{history_states}\n\n额外要求：\n{extra_requirements}"
+  },
+  "debug_mode": {
+    "type": "bool",
+    "description": "调试模式",
+    "hint": "输出更多日志，便于排查生成、解析和注入问题。",
+    "default": false
+  },
+  "optional_fields_enabled": {
+    "type": "list",
+    "description": "启用的时间线可选字段",
+    "hint": "从 mood / emoji / location / note 中选择。默认开启 mood 与 emoji。",
+    "items": {
+      "type": "string"
+    },
+    "default": [
+      "mood",
+      "emoji"
+    ]
+  },
+  "weather_enable": {
+    "type": "bool",
+    "description": "显示当天天气",
+    "hint": "开启后 /life 输出会在日期下方显示当天天气（emoji + 天气 + 温度）。数据来自 Open-Meteo，无需配置密钥。",
+    "default": true
+  },
+  "weather_city": {
+    "type": "string",
+    "description": "天气城市",
+    "hint": "查询天气的城市名，例如「成都」。留空则默认成都。仅支持能在地理编码服务中检索到的城市。",
+    "default": "成都"
+  }
+}
