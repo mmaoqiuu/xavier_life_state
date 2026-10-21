@@ -1,3 +1,4 @@
+import asyncio
 import datetime
 import re
 from collections.abc import AsyncGenerator
@@ -27,18 +28,17 @@ from .core.state import (
     LifeState,
     SlotMatch,
     TimelineEntry,
+    day_start_from_config,
+    entries_in_window,
     find_slot_by_name,
+    format_clock,
     get_enabled_fields,
     minute_of_day,
     mood_emoji,
     parse_clock_time,
     select_current_slot,
+    timeline_window_from_config,
 )
-
-
-def _format_minute(minute: int) -> str:
-    hour, minute_of_hour = divmod(minute, 60)
-    return f"{hour:02d}:{minute_of_hour:02d}"
 
 
 def _extract_args_after(message_str: str, command: str) -> str | None:
@@ -68,8 +68,12 @@ class DynamicLifeStatePlugin(Star):
         except Exception:
             logger.exception("[DynamicLifeState] 天气服务初始化失败")
         self._start_scheduler()
+        self._catch_up_task = asyncio.create_task(self._startup_catch_up())
 
     async def terminate(self) -> None:
+        task = getattr(self, "_catch_up_task", None)
+        if task is not None and not task.done():
+            task.cancel()
         self._stop_scheduler()
         try:
             await self.weather.terminate()
@@ -81,13 +85,38 @@ class DynamicLifeStatePlugin(Star):
     def _now(self) -> datetime.datetime:
         return datetime.datetime.now(CHINA_TIMEZONE)
 
+    def _day_start(self) -> int:
+        """生活日起点（分钟）。"""
+        return day_start_from_config(self.config.get("day_start", "06:00"))
+
+    def _window(self) -> tuple[int, int]:
+        """日程窗口（起点分钟, 终点分钟）。"""
+        return timeline_window_from_config(self.config)
+
     def _current_date(self, now: datetime.datetime | None = None) -> datetime.date:
+        """按「生活日」计算日期：day_start 之前算前一天。
+
+        例如 day_start=06:00 时，09-29 01:00 属于 09-28 这一天。
+        """
         value = now or self._now()
         if value.tzinfo is None:
             value = value.replace(tzinfo=CHINA_TIMEZONE)
         else:
             value = value.astimezone(CHINA_TIMEZONE)
-        return value.date()
+        return (value - datetime.timedelta(minutes=self._day_start())).date()
+
+    def _window_footer(self, now: datetime.datetime) -> str:
+        """当前时间不在日程窗口内时给出一条说明，否则返回空串。"""
+        start, end = self._window()
+        if start > end:
+            return ""
+        minute = minute_of_day(now)
+        scope = f"日程 {format_clock(start)}-{format_clock(end)}"
+        if minute < start:
+            return f"（当前不在{scope}之内，今天的日程还没开始。）"
+        if minute >= end:
+            return f"（当前不在{scope}之内，今天的日程已经收尾。）"
+        return ""
 
     def _select_current_state(
         self, now: datetime.datetime
@@ -109,16 +138,18 @@ class DynamicLifeStatePlugin(Star):
                     "misfire_grace_time": 120,
                 },
             )
+            day_start = self._day_start()
             self._scheduler.add_job(
                 self._daily_generate,
                 "cron",
-                hour=0,
-                minute=0,
+                hour=day_start // 60,
+                minute=day_start % 60,
                 id="dynamic_life_state_daily",
             )
             self._scheduler.start()
             logger.info(
-                f"[DynamicLifeState] Scheduler started at 00:00 {CHINA_TIMEZONE.key}"
+                f"[DynamicLifeState] Scheduler started at "
+                f"{format_clock(day_start)} {CHINA_TIMEZONE.key}"
             )
         except Exception as e:
             logger.error(f"[DynamicLifeState] Scheduler startup failed: {e}")
@@ -129,6 +160,25 @@ class DynamicLifeStatePlugin(Star):
                 self._scheduler.shutdown()
         except Exception:
             pass
+
+    async def _startup_catch_up(self) -> None:
+        """启动后若当天状态缺失，补生成一次，避免长时间没有新状态。"""
+        try:
+            await asyncio.sleep(3)
+            now = self._now()
+            data, target_date = self._select_current_state(now)
+            if data is not None:
+                return
+            if self.generator.is_generating:
+                return
+            logger.info(
+                f"[DynamicLifeState] Startup catch-up generation for {target_date}"
+            )
+            await self.generator.generate(target_date)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("[DynamicLifeState] Startup catch-up failed")
 
     async def _daily_generate(self) -> None:
         now = self._now()
@@ -150,6 +200,10 @@ class DynamicLifeStatePlugin(Star):
             if not self._is_session_enabled(event.unified_msg_origin):
                 return
 
+            self._cleanup_previous_injection(req)
+            if not self._should_inject(event.message_str):
+                return
+
             now = self._now()
             data, target_date = self._select_current_state(now)
             if data is None:
@@ -160,27 +214,55 @@ class DynamicLifeStatePlugin(Star):
                     return
                 data = result.state
 
-            current_match = select_current_slot(data.timeline, minute_of_day(now))
+            window = self._window()
+            current_match = select_current_slot(
+                data.timeline, minute_of_day(now), window
+            )
 
             injection_method = str(
                 self.config.get("injection_mode", "extra_user_content_parts")
             )
             injection_method = self._resolve_injection_method(req, injection_method)
-            self._cleanup_previous_injection(req)
 
             if injection_method == "extra_user_content_parts":
-                inject_text = build_injection_text(data, current_match, now)
+                inject_text = build_injection_text(
+                    data,
+                    current_match,
+                    now,
+                    window=window,
+                    day_start=self._day_start(),
+                )
                 req.extra_user_content_parts.append(
                     TextPart(text=inject_text).mark_as_temp()
                 )
             elif injection_method == "fake_tool_call":
-                fake_messages = build_fake_tool_call(data, current_match, now)
+                fake_messages = build_fake_tool_call(
+                    data,
+                    current_match,
+                    now,
+                    window=window,
+                    day_start=self._day_start(),
+                )
                 req.contexts.extend(fake_messages)
 
         except Exception:
             logger.exception("[DynamicLifeState] on_llm_request failed")
 
     # ===== Session =====
+
+    def _should_inject(self, message_str: str) -> bool:
+        raw = self.config.get("injection_trigger_keywords", ["在干嘛"])
+        if isinstance(raw, str):
+            raw = [raw]
+        elif not isinstance(raw, (list, tuple)):
+            raw = []
+
+        keywords = [str(item).strip().casefold() for item in raw if str(item).strip()]
+        if not keywords:
+            return True
+
+        text = str(message_str or "").casefold()
+        return any(keyword in text for keyword in keywords)
 
     def _is_session_enabled(self, unified_msg_origin: str) -> bool:
         mode = str(self.config.get("session_list_mode", "whitelist")).strip()
@@ -305,13 +387,16 @@ class DynamicLifeStatePlugin(Star):
         match: SlotMatch,
         *,
         weather_line: str | None = None,
+        footer: str = "",
     ) -> str:
-        """渲染当前时段：仅天气与事件（时段由条目自带）。"""
+        """渲染当前时段：天气 + 条目 + 可选脚注。"""
         lines: list[str] = []
         if weather_line:
             lines.append(weather_line)
         enabled = get_enabled_fields(self.config)
         lines.append(self._format_timeline_entry(match.entry, enabled))
+        if footer:
+            lines.append(footer)
         return "\n".join(lines)
 
     def _format_full_state(
@@ -329,7 +414,7 @@ class DynamicLifeStatePlugin(Star):
             ]
         )
         enabled = get_enabled_fields(self.config)
-        for entry in state.timeline:
+        for entry in entries_in_window(state.timeline, self._window()):
             lines.append(self._format_timeline_entry(entry, enabled))
         return "\n".join(lines)
 
@@ -396,36 +481,53 @@ class DynamicLifeStatePlugin(Star):
             yield event.plain_result("没有可用的时段状态。")
             return
 
+        window = self._window()
+        window_footer = self._window_footer(now)
+
         if not time_query:
-            match = select_current_slot(data.timeline, minute_of_day(now))
+            match = select_current_slot(
+                data.timeline, minute_of_day(now), window
+            )
             if match is None:
-                yield event.plain_result("没有可用的时段状态。")
+                yield event.plain_result(window_footer or "没有可用的时段状态。")
                 return
             weather_line = await self._weather_line_for(target_date, now)
             yield event.plain_result(
-                self._format_current_state(match, weather_line=weather_line)
+                self._format_current_state(
+                    match,
+                    weather_line=weather_line,
+                    footer=window_footer,
+                )
             )
             return
 
         if time_query in NATURAL_SLOT_NAMES:
-            match = find_slot_by_name(data.timeline, time_query)
+            match = find_slot_by_name(data.timeline, time_query, window)
             if match is None:
                 yield event.plain_result("没有可用的时段状态。")
                 return
             weather_line = await self._weather_line_for(target_date, now)
             yield event.plain_result(
-                self._format_current_state(match, weather_line=weather_line)
+                self._format_current_state(
+                    match,
+                    weather_line=weather_line,
+                    footer=window_footer,
+                )
             )
             return
 
         query_minute = parse_clock_time(time_query)
-        match = select_current_slot(data.timeline, query_minute)
+        match = select_current_slot(data.timeline, query_minute, window)
         if match is None:
             yield event.plain_result("没有可用的时段状态。")
             return
         weather_line = await self._weather_line_for(target_date, now)
         yield event.plain_result(
-            self._format_current_state(match, weather_line=weather_line)
+            self._format_current_state(
+                match,
+                weather_line=weather_line,
+                footer=window_footer,
+            )
         )
 
     @life.command("full")
@@ -508,7 +610,7 @@ class DynamicLifeStatePlugin(Star):
         now = self._now()
         _, target_date = self._select_current_state(now)
         lock_minute = minute_of_day(now)
-        lock_text = _format_minute(lock_minute)
+        lock_text = format_clock(lock_minute)
 
         if extra:
             yield event.plain_result(

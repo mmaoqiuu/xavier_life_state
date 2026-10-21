@@ -299,7 +299,7 @@ class WeatherService:
         try:
             if not self._cache_file.exists():
                 return
-            raw = json.loads(self._cache_file.read_text(encoding="utf-8"))
+            raw = json.loads(self._cache_file.read_text(encoding="utf-8-sig"))
             if not isinstance(raw, dict) or raw.get("version") != CACHE_VERSION:
                 return
             geo = raw.get("geo")

@@ -210,6 +210,12 @@ def format_interval(interval: TimeInterval) -> str:
     return f"[{start_hour:02d}:{start_minute:02d}, {end_hour:02d}:{end_minute:02d})"
 
 
+def format_clock(minute: int) -> str:
+    """把当天分钟数格式化为 HH:MM。"""
+    hour, minute_of_hour = divmod(int(minute), 60)
+    return f"{hour:02d}:{minute_of_hour:02d}"
+
+
 MAX_HISTORY_DAYS = 7
 _HISTORY_FILE_RE = re.compile(r"life_state_(\d{4}\.\d{2}\.\d{2})\.json")
 
@@ -342,7 +348,7 @@ class DataManager:
         if not path.exists():
             return None
         try:
-            raw = json.loads(path.read_text(encoding="utf-8"))
+            raw = json.loads(path.read_text(encoding="utf-8-sig"))
             if not isinstance(raw, dict):
                 return None
             return LifeState.from_dict(raw)
@@ -444,24 +450,145 @@ class DataManager:
                 )
 
 
-_NATURAL_SLOTS: dict[str, tuple[int, int]] = {
-    "凌晨": (0, 6 * 60),
-    "早上": (6 * 60, 9 * 60),
-    "上午": (9 * 60, 12 * 60),
-    "中午": (12 * 60, 14 * 60),
-    "下午": (14 * 60, 18 * 60),
-    "傍晚": (18 * 60, 20 * 60),
-    "晚上": (20 * 60, 23 * 60),
-    "深夜": (23 * 60, 24 * 60),
+# ===== 时段表 =====
+# 日程只覆盖一个窗口（默认 08:00-20:00），窗口内分 4 个粗时段；
+# 窗口外（夜间）不属于日程范围：不生成、不匹配、不注入。
+# 区间均为左闭右开。
+
+DEFAULT_DAY_START = 6 * 60   # 生活日默认从 06:00 开始（仅用于日期归属与每日生成时刻）
+MAX_DAY_START = 9 * 60       # 最晚 09:00
+
+# 日程窗口（分钟）
+DEFAULT_TIMELINE_START = 8 * 60    # 默认 08:00
+DEFAULT_TIMELINE_END = 20 * 60     # 默认 20:00
+MIN_TIMELINE_START = 5 * 60        # 最早 05:00
+MAX_TIMELINE_START = 11 * 60       # 最晚 11:00（保证「上午」非空）
+MIN_TIMELINE_END = 18 * 60         # 最早 18:00（保证「晚上」非空）
+MAX_TIMELINE_END = 23 * 60         # 最晚 23:00
+
+# 窗口内的粗时段名，顺序即先后顺序
+NATURAL_SLOT_NAMES: tuple[str, ...] = ("上午", "中午", "下午", "晚上")
+
+# 旧版时段名，仅用于解析历史数据，避免旧状态失效
+_LEGACY_SLOT_RANGES: dict[str, tuple[tuple[int, int], ...]] = {
+    "凌晨": ((0, 6 * 60),),
+    "早上": ((6 * 60, 9 * 60),),
+    "上午": ((9 * 60, 12 * 60),),
+    "中午": ((12 * 60, 14 * 60),),
+    "下午": ((14 * 60, 18 * 60),),
+    "傍晚": ((18 * 60, 20 * 60),),
+    "晚上": ((20 * 60, 23 * 60),),
+    "深夜": ((23 * 60, 24 * 60),),
 }
 
-NATURAL_SLOT_NAMES: tuple[str, ...] = tuple(_NATURAL_SLOTS.keys())
+
+def clamp_day_start(day_start: int | None) -> int:
+    """把生活日起点裁剪到合理范围（00:00 ~ 09:00）。"""
+    try:
+        value = int(day_start) if day_start is not None else DEFAULT_DAY_START
+    except (TypeError, ValueError):
+        value = DEFAULT_DAY_START
+    return max(0, min(value, MAX_DAY_START))
+
+
+def _clamped_minute(value, default: int, low: int, high: int) -> int:
+    """解析配置里的 HH:MM（或分钟数）并裁剪到 [low, high]；失败回退默认。"""
+    if isinstance(value, bool):
+        return default
+    minute: int | None = None
+    if isinstance(value, (int, float)):
+        minute = int(value)
+    else:
+        try:
+            minute = parse_clock_time(str(value))
+        except Exception:
+            minute = None
+    if minute is None:
+        return default
+    return max(low, min(minute, high))
+
+
+def clamp_timeline_start(value) -> int:
+    """日程窗口起点（分钟），默认 08:00，限制在 05:00 ~ 11:00。"""
+    return _clamped_minute(
+        value, DEFAULT_TIMELINE_START, MIN_TIMELINE_START, MAX_TIMELINE_START
+    )
+
+
+def clamp_timeline_end(value) -> int:
+    """日程窗口终点（分钟），默认 20:00，限制在 18:00 ~ 23:00。"""
+    return _clamped_minute(
+        value, DEFAULT_TIMELINE_END, MIN_TIMELINE_END, MAX_TIMELINE_END
+    )
+
+
+def resolve_window(window: tuple[int, int] | None = None) -> tuple[int, int]:
+    """规整日程窗口参数；None 或非法值回退默认窗口。"""
+    if not window:
+        return DEFAULT_TIMELINE_START, DEFAULT_TIMELINE_END
+    try:
+        start, end = int(window[0]), int(window[1])
+    except (TypeError, ValueError, IndexError):
+        return DEFAULT_TIMELINE_START, DEFAULT_TIMELINE_END
+    return clamp_timeline_start(start), clamp_timeline_end(end)
+
+
+def timeline_window_from_config(config: object) -> tuple[int, int]:
+    """从插件配置解析日程窗口，返回 (起点分钟, 终点分钟)。"""
+    getter = getattr(config, "get", None)
+    if getter is None:
+        return DEFAULT_TIMELINE_START, DEFAULT_TIMELINE_END
+    try:
+        start = clamp_timeline_start(getter("timeline_start", ""))
+        end = clamp_timeline_end(getter("timeline_end", ""))
+    except Exception:
+        logger.exception("[DynamicLifeState] 日程窗口配置解析失败，已回退默认")
+        return DEFAULT_TIMELINE_START, DEFAULT_TIMELINE_END
+    return start, end
+
+
+def natural_slots(
+    window: tuple[int, int] | None = None,
+) -> dict[str, tuple[tuple[int, int], ...]]:
+    """按日程窗口生成粗时段区间表（左闭右开）。"""
+    start, end = resolve_window(window)
+    return {
+        "上午": ((start, 12 * 60),),
+        "中午": ((12 * 60, 14 * 60),),
+        "下午": ((14 * 60, 18 * 60),),
+        "晚上": ((18 * 60, end),),
+    }
+
+
+def is_minute_in_timeline_window(
+    minute: int, window: tuple[int, int] | None = None
+) -> bool:
+    """判断某分钟是否落在日程窗口内（window 为 (起点, 终点) 分钟对）。"""
+    start, end = resolve_window(window)
+    return start <= minute < end
+
+
+def _slot_raw_ranges(
+    name: str, window: tuple[int, int] | None = None
+) -> tuple[tuple[int, int], ...] | None:
+    """取时段名对应的原始区间：先查窗口时段，再退回旧时段名。"""
+    slots = natural_slots(window)
+    if name in slots:
+        return slots[name]
+    return _LEGACY_SLOT_RANGES.get(name)
+
+
+def day_offset(minute: int, day_start: int = DEFAULT_DAY_START) -> int:
+    """把「当天时钟分钟」换算成「自生活日起点以来的分钟」。"""
+    return (minute - clamp_day_start(day_start)) % (24 * 60)
 
 _TIME_RANGE_RE = re.compile(r"(\d{1,2}):(\d{2})\s*[-–—~]\s*(\d{1,2}):(\d{2})")
 _CLOCK_TIME_RE = re.compile(r"(\d{2}):(\d{2})")
 
 
-def _parse_time_slot(time_str: str) -> tuple[int, int] | None:
+def _parse_time_slot(
+    time_str: str, window: tuple[int, int] | None = None
+) -> tuple[tuple[int, int], ...] | None:
     value = time_str.strip()
     match = _TIME_RANGE_RE.fullmatch(value)
     if match:
@@ -476,11 +603,16 @@ def _parse_time_slot(time_str: str) -> tuple[int, int] | None:
         end = end_hour * 60 + end_minute
         if start == end:
             return None
-        return start, end
+        if end <= start:
+            end = 24 * 60
+        return ((start, end),)
 
-    for keyword, interval in _NATURAL_SLOTS.items():
+    for keyword, ranges in natural_slots(window).items():
         if keyword in value:
-            return interval
+            return ranges
+    for keyword, ranges in _LEGACY_SLOT_RANGES.items():
+        if keyword in value:
+            return ranges
     return None
 
 
@@ -488,8 +620,10 @@ def _is_specific_time_range(time_str: str) -> bool:
     return _TIME_RANGE_RE.fullmatch(time_str.strip()) is not None
 
 
-def is_valid_time_slot(time_str: str) -> bool:
-    return _parse_time_slot(time_str) is not None
+def is_valid_time_slot(
+    time_str: str, window: tuple[int, int] | None = None
+) -> bool:
+    return _parse_time_slot(time_str, window) is not None
 
 
 def parse_clock_time(value: str) -> int:
@@ -506,104 +640,163 @@ def minute_of_day(value: datetime.datetime) -> int:
     return value.hour * 60 + value.minute
 
 
-def resolve_entry_intervals(entry: TimelineEntry) -> tuple[TimeInterval, ...]:
-    parsed = _parse_time_slot(entry.time)
-    if parsed is None:
+def resolve_entry_intervals(
+    entry: TimelineEntry, window: tuple[int, int] | None = None
+) -> tuple[TimeInterval, ...]:
+    parsed = _parse_time_slot(entry.time, window)
+    if not parsed:
         return ()
-    start, end = parsed
-    if end <= start:
-        end = 24 * 60
-    return (TimeInterval(start, end),)
+    return tuple(TimeInterval(start, end) for start, end in parsed)
 
 
-def entry_start_minute(entry: TimelineEntry) -> int | None:
-    """返回条目的起始分钟；无法解析时返回 None。"""
-    parsed = _parse_time_slot(entry.time)
-    if parsed is None:
+def entry_start_minute(
+    entry: TimelineEntry, window: tuple[int, int] | None = None
+) -> int | None:
+    """返回条目的起始分钟（当天时钟）；无法解析时返回 None。"""
+    parsed = _parse_time_slot(entry.time, window)
+    if not parsed:
         return None
-    return parsed[0]
+    return parsed[0][0]
+
+
+def entry_start_offset(
+    entry: TimelineEntry, day_start: int = DEFAULT_DAY_START
+) -> int | None:
+    """返回条目相对生活日起点的偏移分钟；无法解析时返回 None。"""
+    start = entry_start_minute(entry)
+    if start is None:
+        return None
+    return day_offset(start, day_start)
+
+
+def entries_in_window(
+    timeline: list[TimelineEntry], window: tuple[int, int] | None = None
+) -> list[TimelineEntry]:
+    """只保留起始时间落在日程窗口内的条目（用于历史参考与生成结果清洗）。"""
+    start, end = resolve_window(window)
+    kept: list[TimelineEntry] = []
+    for entry in timeline:
+        minute = entry_start_minute(entry, window)
+        if minute is not None and start <= minute < end:
+            kept.append(entry)
+    return kept
 
 
 def split_timeline_at(
     timeline: list[TimelineEntry],
-    minute: int,
+    current_offset: int,
+    day_start: int = DEFAULT_DAY_START,
 ) -> tuple[list[TimelineEntry], list[TimelineEntry]]:
-    """按起始时间把时间线拆成（已开始, 未开始）两组，两组都保持原顺序。"""
+    """按「生活日偏移」把时间线拆成（已开始, 未开始）两组，两组都保持原顺序。
+
+    用生活日偏移而非时钟分钟比较，跨午夜的时段也能正确排序。
+    """
     started: list[TimelineEntry] = []
     upcoming: list[TimelineEntry] = []
     for entry in timeline:
-        start = entry_start_minute(entry)
-        if start is not None and start <= minute:
+        offset = entry_start_offset(entry, day_start)
+        if offset is not None and offset <= current_offset:
             started.append(entry)
         else:
             upcoming.append(entry)
     return started, upcoming
 
 
-def _natural_slot_name(minute: int) -> str | None:
-    for name, (start, end) in _NATURAL_SLOTS.items():
-        if start <= minute < end:
-            return name
+def _natural_slot_name(
+    minute: int, window: tuple[int, int] | None = None
+) -> str | None:
+    for name, ranges in natural_slots(window).items():
+        for start, end in ranges:
+            if start <= minute < end:
+                return name
     return None
 
 
 def select_current_slot(
     timeline: list[TimelineEntry],
     current_minute: int,
+    window: tuple[int, int] | None = None,
 ) -> SlotMatch | None:
     if not timeline or not 0 <= current_minute < 24 * 60:
         return None
 
-    specific_entries: list[TimelineEntry] = []
-    natural_entries: list[TimelineEntry] = []
+    specific_entries: list[tuple[TimelineEntry, tuple[TimeInterval, ...]]] = []
+    natural_entries: list[tuple[TimelineEntry, tuple[TimeInterval, ...]]] = []
     for entry in timeline:
-        if _parse_time_slot(entry.time) is None:
+        intervals = resolve_entry_intervals(entry, window)
+        if not intervals:
             continue
         if _is_specific_time_range(entry.time):
-            specific_entries.append(entry)
+            specific_entries.append((entry, intervals))
         else:
-            natural_entries.append(entry)
+            natural_entries.append((entry, intervals))
 
-    for entry in specific_entries:
-        intervals = resolve_entry_intervals(entry)
+    for entry, intervals in specific_entries:
         for interval in intervals:
             if interval.contains(current_minute):
                 return SlotMatch(entry, intervals, interval)
 
-    for entry in natural_entries:
-        intervals = resolve_entry_intervals(entry)
+    for entry, intervals in natural_entries:
         for interval in intervals:
             if interval.contains(current_minute):
                 return SlotMatch(entry, intervals, interval)
 
-    current_slot_name = _natural_slot_name(current_minute)
+    current_slot_name = _natural_slot_name(current_minute, window)
     if current_slot_name is None:
         return None
 
-    interval = TimeInterval(*_NATURAL_SLOTS[current_slot_name])
+    intervals = tuple(
+        TimeInterval(start, end)
+        for start, end in natural_slots(window)[current_slot_name]
+    )
+    active = next(
+        (interval for interval in intervals if interval.contains(current_minute)),
+        intervals[0],
+    )
     return SlotMatch(
         TimelineEntry(time=current_slot_name, schedule="空闲"),
-        (interval,),
-        interval,
+        intervals,
+        active,
     )
 
 
 def find_slot_by_name(
     timeline: list[TimelineEntry],
     name: str,
+    window: tuple[int, int] | None = None,
 ) -> SlotMatch | None:
-    if name not in _NATURAL_SLOTS:
+    if name not in natural_slots(window) and name not in _LEGACY_SLOT_RANGES:
         return None
 
     for entry in timeline:
         if entry.time == name:
-            intervals = resolve_entry_intervals(entry)
+            intervals = resolve_entry_intervals(entry, window)
             active = intervals[0] if intervals else None
             return SlotMatch(entry, intervals, active)
 
-    interval = TimeInterval(*_NATURAL_SLOTS[name])
+    ranges = _slot_raw_ranges(name, window)
+    if not ranges:
+        return None
+    intervals = tuple(TimeInterval(start, end) for start, end in ranges)
     return SlotMatch(
         TimelineEntry(name, "空闲"),
-        (interval,),
-        interval,
+        intervals,
+        intervals[0],
     )
+
+
+# ===== 生活日起点 =====
+
+
+
+
+def day_start_from_config(value) -> int:
+    """把配置值（如 "06:00"）解析为生活日起点分钟，失败则回退默认。"""
+    if isinstance(value, bool):
+        return DEFAULT_DAY_START
+    if isinstance(value, (int, float)):
+        return clamp_day_start(int(value))
+    try:
+        return clamp_day_start(parse_clock_time(str(value)))
+    except Exception:
+        return clamp_day_start(None)
