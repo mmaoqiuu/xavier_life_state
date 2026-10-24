@@ -1,3 +1,21 @@
+## v2.4.0
+* 新增：午睡系统（core/nap.py）
+  - 起点 12:20~14:00 随机，时长 20~60 分钟，硬性保证 15:00 前醒来
+  - 当日掷骰一次后落盘 nap_state.json，重载不改结果；命中才安排，未命中就正常过日子
+  - 概率跟夜间睡眠联动：熬夜后高概率补觉，睡饱则大幅降低
+* 新增：睡眠数据与「小狗健康」对齐
+  - 沈星回的基础睡眠时长直接读取 astrbot_plugin_Xavier_care 当天的 sleep.duration_min（最近 4 天兜底）
+  - 在此基础上浮动 +30~60 分钟，用户熬夜/早睡会自动同频
+  - 反向回写：睡前写 sleep_bridge.json（昨夜睡眠 + 午睡加成），健康面板优先读它，两边不再各算各的
+* 新增：Otto 代班
+  - 午睡期间收到的消息由机械管家 Otto 接手转达，提示词精简成两三句，留足发挥空间
+  - 配置项 otto_hosting_prompt 可自定义，留空用内置版
+* 新增：叫醒与结算
+  - 叫醒关键词命中即提前结束午睡（nap_wake_keywords）
+  - 自然醒来或被打断都按实际时长折算加成，最多 60 分钟
+* 配置：新增 nap_enable / nap_window / nap_duration / nap_chance 系列 / nap_wake_keywords / otto_hosting_prompt / sleep_bridge_enable
+* 版本号更新至 v2.4.0
+
 ## v2.3.0
 * 新增：生活状态改为关键词触发注入
   - 新配置 `injection_trigger_keywords`（字符串列表，默认 `["在干嘛"]`）

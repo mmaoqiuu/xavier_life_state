@@ -179,5 +179,110 @@
     "description": "天气城市",
     "hint": "查询天气的城市名，例如「成都」。留空则默认成都。仅支持能在地理编码服务中检索到的城市。",
     "default": "成都"
+  },
+  "nap_enable": {
+    "type": "bool",
+    "description": "启用午睡",
+    "hint": "开启后每天按夜间睡眠质量掷骰，可能安排一次 20~60 分钟的小睡；午睡期间由 Otto 代班回消息。",
+    "default": true
+  },
+  "nap_window": {
+    "type": "list",
+    "description": "午睡起点范围",
+    "hint": "格式 [\"12:20\", \"14:00\"]，起点在这个区间内随机；时长会保证 15:00 前醒来。",
+    "items": {
+      "type": "string"
+    },
+    "default": [
+      "12:20",
+      "14:00"
+    ]
+  },
+  "nap_duration": {
+    "type": "list",
+    "description": "午睡时长范围（分钟）",
+    "hint": "格式 [20, 60]。",
+    "items": {
+      "type": "int"
+    },
+    "default": [
+      20,
+      60
+    ]
+  },
+  "nap_chance": {
+    "type": "float",
+    "description": "午睡基础概率",
+    "hint": "夜间睡眠普通时的午睡概率。",
+    "slider": {
+      "min": 0.0,
+      "max": 1.0,
+      "step": 0.05
+    },
+    "default": 0.5
+  },
+  "nap_chance_short": {
+    "type": "float",
+    "description": "熬夜后午睡概率",
+    "hint": "夜间睡眠低于下面的阈值时使用，建议高一些。",
+    "slider": {
+      "min": 0.0,
+      "max": 1.0,
+      "step": 0.05
+    },
+    "default": 0.85
+  },
+  "nap_chance_full": {
+    "type": "float",
+    "description": "睡饱后午睡概率",
+    "hint": "夜间睡眠达到阈值时使用，建议低一些。",
+    "slider": {
+      "min": 0.0,
+      "max": 1.0,
+      "step": 0.05
+    },
+    "default": 0.2
+  },
+  "nap_short_min": {
+    "type": "int",
+    "description": "睡眠不足阈值（分钟）",
+    "hint": "低于这个值视为熬夜，用「熬夜后午睡概率」。",
+    "default": 420
+  },
+  "nap_full_min": {
+    "type": "int",
+    "description": "睡眠充足阈值（分钟）",
+    "hint": "达到这个值用「睡饱后午睡概率」。",
+    "default": 480
+  },
+  "nap_wake_keywords": {
+    "type": "list",
+    "description": "叫醒关键词",
+    "hint": "消息命中任一关键词就读作「把他叫醒」，午睡立即结束。",
+    "items": {
+      "type": "string"
+    },
+    "default": [
+      "叫醒他",
+      "叫醒",
+      "起床了",
+      "该起来了",
+      "醒醒",
+      "别睡了"
+    ]
+  },
+  "otto_hosting_prompt": {
+    "type": "text",
+    "description": "Otto 代班提示词",
+    "hint": "留空使用内置精简版：活泼话痨的机械管家，代为转达留言。",
+    "editor_mode": true,
+    "editor_language": "markdown",
+    "default": ""
+  },
+  "sleep_bridge_enable": {
+    "type": "bool",
+    "description": "回写睡眠数据",
+    "hint": "把「昨夜睡眠 + 午睡加成」写到 data/plugin_data/xavier_life_state/sleep_bridge.json，本家健康面板会优先读取。关掉则两边各算各的。",
+    "default": true
   }
 }

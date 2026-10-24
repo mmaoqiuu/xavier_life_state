@@ -15,6 +15,7 @@ from astrbot.core.provider.entities import ProviderRequest
 from astrbot.core.star.star_tools import StarTools
 
 from .core.generator import Generator
+from .core.nap import NapManager
 from .core.injector import (
     build_fake_tool_call,
     build_injection_text,
@@ -59,6 +60,7 @@ class DynamicLifeStatePlugin(Star):
         self.data_dir = StarTools.get_data_dir()
         self.state_file = self.data_dir / "life_state.json"
         self.weather = WeatherService(self.config, self.data_dir)
+        self.nap = NapManager(self.data_dir, self.config)
 
     async def initialize(self) -> None:
         self.data_mgr = DataManager(self.state_file)
@@ -146,6 +148,12 @@ class DynamicLifeStatePlugin(Star):
                 minute=day_start % 60,
                 id="dynamic_life_state_daily",
             )
+            self._scheduler.add_job(
+                self._nap_settle,
+                "interval",
+                minutes=10,
+                id="dynamic_life_state_nap_settle",
+            )
             self._scheduler.start()
             logger.info(
                 f"[DynamicLifeState] Scheduler started at "
@@ -188,6 +196,13 @@ class DynamicLifeStatePlugin(Star):
             return
         await self.generator.generate(target_date)
 
+    async def _nap_settle(self) -> None:
+        """定时把已经过了终点的午睡结算掉，顺便把数据桥刷到当天。"""
+        try:
+            self.nap.settle_if_due(self._now())
+        except Exception:
+            logger.exception("[DynamicLifeState] nap settle failed")
+
     # ===== LLM Hook =====
 
     @filter.on_llm_request()
@@ -201,10 +216,12 @@ class DynamicLifeStatePlugin(Star):
                 return
 
             self._cleanup_previous_injection(req)
+            now = self._now()
+            if self._handle_nap(req, event, now):
+                return
             if not self._should_inject(event.message_str):
                 return
 
-            now = self._now()
             data, target_date = self._select_current_state(now)
             if data is None:
                 if self.generator.is_generating:
@@ -247,6 +264,35 @@ class DynamicLifeStatePlugin(Star):
 
         except Exception:
             logger.exception("[DynamicLifeState] on_llm_request failed")
+
+    def _handle_nap(
+        self, req: ProviderRequest, event: AstrMessageEvent, now: datetime.datetime
+    ) -> bool:
+        """午睡期间接管本轮请求；返回 True 表示已经处理，不再注入日程。"""
+        if not self.nap.enabled():
+            return False
+        nap = self.nap.active(now)
+        if nap is None:
+            return False
+
+        if self.nap.is_wake_request(event.message_str):
+            self.nap.mark_wake(now)
+            logger.info("[DynamicLifeState] 午睡被叫醒，本轮不注入日程")
+            return True
+
+        prompt = self.nap.otto_prompt()
+        clock = now.strftime("%H:%M")
+        req.system_prompt = f"{prompt}\n\n现在是 {clock}。"
+        hosting_text = (
+            "<otto_hosting>\n"
+            "沈星回正在睡午觉，你暂时作为 Otto 替他看消息、记下留言。\n"
+            f"他大概 {nap.get('end', '')} 醒来。\n"
+            "</otto_hosting>"
+        )
+        req.extra_user_content_parts.append(
+            TextPart(text=hosting_text).mark_as_temp()
+        )
+        return True
 
     # ===== Session =====
 
@@ -435,6 +481,25 @@ class DynamicLifeStatePlugin(Star):
     @filter.command_group("life")
     def life(self) -> None:
         pass
+
+    @life.command("nap")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def life_nap(
+        self, event: AstrMessageEvent, action: str = ""
+    ) -> AsyncGenerator[object, None]:
+        now = self._now()
+        action = action.strip().lower()
+        if action in ("test", "on"):
+            data = self.nap.force_now(now, 30)
+            yield event.plain_result(
+                f"已切到午睡：{data.get('start')}-{data.get('end')}，Otto 上线。"
+            )
+            return
+        if action == "off":
+            self.nap.cancel_today(now)
+            yield event.plain_result("今天取消午睡。")
+            return
+        yield event.plain_result(self.nap.describe(now))
 
     @life.command("state")
     @filter.permission_type(filter.PermissionType.ADMIN)
