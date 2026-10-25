@@ -186,6 +186,18 @@
     "hint": "开启后每天按夜间睡眠质量掷骰，可能安排一次 20~60 分钟的小睡；午睡期间由 Otto 代班回消息。",
     "default": true
   },
+  "nap_decide_deadline": {
+    "type": "string",
+    "description": "睡眠兜底线",
+    "hint": "到这个点还没等到当天的睡眠数据，就用最近一次记录顶上，并标记为估算值。格式 HH:MM。",
+    "default": "11:00"
+  },
+  "nap_require_wake": {
+    "type": "bool",
+    "description": "要求数据完整",
+    "hint": "开启后必须拿到 wake_time（起床时间）才算数据到位，避免只传了一半就定计划。",
+    "default": true
+  },
   "nap_window": {
     "type": "list",
     "description": "午睡起点范围",

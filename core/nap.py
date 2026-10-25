@@ -2,6 +2,7 @@
 
 设计要点：
 - 午睡用「日期 + 固定种子」稳定掷骰，同一天结果不变，重启后也不会变卦。
+- 时机：当天睡眠数据就绪（或到兜底线）之后才生成计划，0 点不再预生成。
 - 醒来状态（自然醒 / 被叫醒）落到 nap_state.json，午睡分钟数只结算一次。
 - 睡眠时长由这里生成：读用户健康数据（Xavier_care 的日记录），
   在此基础上 +30~60 分钟浮动，写成 night_sleep_min。
@@ -143,46 +144,102 @@ class NapManager:
 
     # ===== 用户睡眠数据（小狗健康） =====
 
-    def health_sleep_min(self, day: datetime.date) -> int | None:
-        """读用户当天（或最近几天）的睡眠时长；读不到就返回 None。"""
+    def _require_wake(self) -> bool:
+        """是否要求 wake_time 才算数据完整。"""
+        return bool(self.config.get("nap_require_wake", True))
+
+    def sleep_deadline_min(self) -> int:
+        """兜底线：到这个点还没有昨夜数据，就用能拿到的值先定下来。"""
+        minute = parse_hhmm(str(self.config.get("nap_decide_deadline", "11:00") or ""))
+        if minute is None:
+            return 11 * 60
+        return max(5 * 60, min(minute, 14 * 60))
+
+    def _read_health_sleep(self, day: datetime.date) -> dict | None:
+        """读某一天的睡眠记录；不合格返回 None。"""
         try:
             if not self.health_dir.is_dir():
                 return None
         except OSError:
             return None
-        for back in range(0, 4):
-            target = day - datetime.timedelta(days=back)
-            path = self.health_dir / f"{target.isoformat()}.json"
-            record = self._read_json(path)
-            sleep = record.get("sleep")
-            if not isinstance(sleep, dict):
-                continue
-            try:
-                minutes = int(sleep.get("duration_min") or 0)
-            except (TypeError, ValueError):
-                continue
-            if minutes > 0:
-                return minutes
+        path = self.health_dir / f"{day.isoformat()}.json"
+        record = self._read_json(path)
+        sleep = record.get("sleep")
+        if not isinstance(sleep, dict):
+            return None
+        try:
+            minutes = int(sleep.get("duration_min") or 0)
+        except (TypeError, ValueError):
+            return None
+        # 离谱值直接丢掉，别让脏数据污染一整天
+        if not (60 <= minutes <= 900):
+            return None
+        return {
+            "minutes": minutes,
+            "source": day.isoformat(),
+            "wake_time": str(sleep.get("wake_time") or "").strip(),
+            "bedtime": str(sleep.get("bedtime") or "").strip(),
+        }
+
+    def _sleep_record(self, day: datetime.date) -> dict | None:
+        """今天的睡眠优先；今天还没传就回退最近几天，并标成非就绪。"""
+        today = self._read_health_sleep(day)
+        if today:
+            ready = bool(today["wake_time"]) or not self._require_wake()
+            today["ready"] = ready
+            return today
+        for back in range(1, 4):
+            prev = self._read_health_sleep(day - datetime.timedelta(days=back))
+            if prev:
+                prev["ready"] = False
+                return prev
         return None
+
+    def health_sleep_min(self, day: datetime.date) -> int | None:
+        """只取夜间时长（兼容老接口）。"""
+        record = self._sleep_record(day)
+        return record["minutes"] if record else None
+
+    def sleep_ready(self, day: datetime.date) -> bool:
+        """今天的睡眠数据是否完整到可以定计划。"""
+        record = self._read_health_sleep(day)
+        if not record:
+            return False
+        return bool(record["wake_time"]) or not self._require_wake()
 
     # ===== 计划 =====
 
-    def ensure_plan(self, day: datetime.date) -> dict:
-        """取当天计划；没有就按稳定掷骰生成。"""
+    def _pending_plan(self, day: datetime.date) -> dict:
+        """睡眠数据还没到时的占位；只返回，不落盘。"""
+        return {
+            "date": day.isoformat(),
+            "pending": True,
+            "night_sleep_min": 0,
+            "user_sleep_min": 0,
+            "chance": 0,
+            "planned": False,
+            "start": "",
+            "end": "",
+            "duration_min": 0,
+            "wake": "",
+            "settled": False,
+            "bonus_min": 0,
+            "estimated": True,
+            "sleep_source": "",
+            "updated_at": datetime.datetime.now(CHINA_TIMEZONE).strftime(
+                "%Y-%m-%d %H:%M"
+            ),
+        }
+
+    def ensure_plan(self, now: datetime.datetime, *, force: bool = False) -> dict:
+        """取当天计划；睡眠数据没到就返回待定，不写文件。"""
+        day = now.date()
         cached = self._read_json(self.nap_path)
-        if cached.get("date") == day.isoformat():
-            return cached
-        return self._build_plan(day)
+        if cached.get("date") == day.isoformat() and not cached.get("pending"):
+            return self.refresh_if_stale(cached, now)
+        return self._build_plan(day, now, force=force)
 
-    def _build_plan(self, day: datetime.date) -> dict:
-        key = day.isoformat()
-        user_sleep = self.health_sleep_min(day)
-        if user_sleep:
-            night = user_sleep + _stable_int(f"{key}:gap", 30, 60)
-        else:
-            night = _stable_int(f"{key}:night", 400, 500)
-        night = max(300, min(600, night))
-
+    def _chance_for(self, night: int) -> float:
         short_min = int(self._float("nap_short_min", 420))
         full_min = int(self._float("nap_full_min", 480))
         chance = self._float("nap_chance", 0.5)
@@ -190,7 +247,101 @@ class NapManager:
             chance = self._float("nap_chance_short", 0.85)
         elif night >= full_min:
             chance = self._float("nap_chance_full", 0.2)
-        planned = _stable_ratio(f"{key}:roll") < max(0.0, min(1.0, chance))
+        return max(0.0, min(1.0, chance))
+
+    def _fit_window(self, data: dict, now: datetime.datetime) -> None:
+        """起床太晚就把午睡往后挪；挪不开就今天不睡。"""
+        if not data.get("planned") or data.get("settled") or data.get("wake"):
+            return
+        start = parse_hhmm(data.get("start", ""))
+        end = parse_hhmm(data.get("end", ""))
+        if start is None or end is None:
+            return
+        minute = now.hour * 60 + now.minute
+        if minute < start:
+            return
+        duration = max(0, end - start)
+        new_start = minute + 15
+        new_end = min(new_start + duration, 15 * 60)
+        if new_end - new_start < 30:
+            data["planned"] = False
+            data["note"] = "起床太晚，今天不午睡了"
+            return
+        data["start"] = format_minute(new_start)
+        data["end"] = format_minute(new_end)
+        data["duration_min"] = new_end - new_start
+
+    def refresh_if_stale(self, data: dict, now: datetime.datetime) -> dict:
+        """睡眠数据晚到或被修正时，把时长和几率更新过来。"""
+        day = now.date()
+        if data.get("date") != day.isoformat():
+            return data
+        record = self._read_health_sleep(day)
+        if not record:
+            return data
+
+        old_user = int(data.get("user_sleep_min") or 0)
+        if record["minutes"] == old_user:
+            return data
+
+        key = day.isoformat()
+        night = record["minutes"] + _stable_int(f"{key}:gap", 30, 60)
+        night = max(record["minutes"], min(720, night))
+
+        data["user_sleep_min"] = record["minutes"]
+        data["night_sleep_min"] = night
+        data["sleep_source"] = record["source"]
+        data["estimated"] = not bool(record.get("ready", True))
+        data["chance"] = round(self._chance_for(night), 3)
+
+        start = parse_hhmm(data.get("start", ""))
+        minute = now.hour * 60 + now.minute
+        # 已经在睡或已结束的，一律不翻案
+        frozen = (
+            bool(data.get("forced"))
+            or bool(data.get("settled"))
+            or bool(data.get("wake"))
+            or (start is not None and minute >= start)
+        )
+        if not frozen:
+            data["planned"] = bool(
+                _stable_ratio(f"{key}:roll") < float(data["chance"])
+            )
+            self._fit_window(data, now)
+            data["decided_at"] = now.strftime("%H:%M")
+
+        data["updated_at"] = now.strftime("%Y-%m-%d %H:%M")
+        self._write_json(self.nap_path, data)
+        self._write_bridge(data)
+        logger.info(
+            f"[DynamicLifeState] 睡眠数据更新：用户 {old_user} -> "
+            f"{record['minutes']} 分钟，夜间 {night} 分钟"
+        )
+        return data
+
+    def _build_plan(
+        self, day: datetime.date, now: datetime.datetime, *, force: bool = False
+    ) -> dict:
+        key = day.isoformat()
+        record = self._sleep_record(day)
+        ready = bool(record and record.get("ready"))
+        minute_now = now.hour * 60 + now.minute
+
+        # 数据没齐、也没到兜底线：今天先不定，等起床后再说
+        if not ready and not force and day == now.date():
+            if minute_now < self.sleep_deadline_min():
+                return self._pending_plan(day)
+
+        if record:
+            night = record["minutes"] + _stable_int(f"{key}:gap", 30, 60)
+            # 角色比对方多睡一会儿，但不低于对方的真实时长
+            night = max(record["minutes"], min(720, night))
+        else:
+            night = _stable_int(f"{key}:night", 400, 500)
+            night = max(300, min(600, night))
+
+        chance = self._chance_for(night)
+        planned = _stable_ratio(f"{key}:roll") < chance
 
         start_low, start_high = self._pair("nap_window", (740, 840))
         dur_low, dur_high = self._duration_range()
@@ -201,8 +352,9 @@ class NapManager:
 
         data = {
             "date": key,
+            "pending": False,
             "night_sleep_min": night,
-            "user_sleep_min": user_sleep or 0,
+            "user_sleep_min": record["minutes"] if record else 0,
             "chance": round(chance, 3),
             "planned": bool(planned),
             "start": format_minute(start),
@@ -211,10 +363,12 @@ class NapManager:
             "wake": "",
             "settled": False,
             "bonus_min": 0,
-            "updated_at": datetime.datetime.now(CHINA_TIMEZONE).strftime(
-                "%Y-%m-%d %H:%M"
-            ),
+            "estimated": not ready,
+            "sleep_source": record["source"] if record else "",
+            "decided_at": now.strftime("%H:%M"),
+            "updated_at": now.strftime("%Y-%m-%d %H:%M"),
         }
+        self._fit_window(data, now)
         self._write_json(self.nap_path, data)
         self._write_bridge(data)
         return data
@@ -225,7 +379,7 @@ class NapManager:
         """当前是否正在午睡；到点会自动结算。"""
         if not self.enabled():
             return None
-        data = self.ensure_plan(now.date())
+        data = self.ensure_plan(now)
         if not data.get("planned") or data.get("wake"):
             return None
         start = parse_hhmm(data.get("start", ""))
@@ -243,7 +397,7 @@ class NapManager:
         """到点未醒来也结算一次（不依赖有人发消息）。"""
         if not self.enabled():
             return
-        data = self.ensure_plan(now.date())
+        data = self.ensure_plan(now)
         if not data.get("planned") or data.get("wake") or data.get("settled"):
             return
         end = parse_hhmm(data.get("end", ""))
@@ -252,7 +406,7 @@ class NapManager:
 
     def mark_wake(self, now: datetime.datetime) -> dict | None:
         """被叫醒：记账、结算午睡时长。"""
-        data = self.ensure_plan(now.date())
+        data = self.ensure_plan(now, force=True)
         if not data.get("planned") or data.get("wake"):
             return None
         minute = now.hour * 60 + now.minute
@@ -292,7 +446,7 @@ class NapManager:
     # ===== 强控（命令用） =====
 
     def force_now(self, now: datetime.datetime, minutes: int = 30) -> dict:
-        data = self.ensure_plan(now.date())
+        data = self.ensure_plan(now, force=True)
         start = now.hour * 60 + now.minute
         end = min(start + max(5, int(minutes)), 900)
         data.update(
@@ -311,7 +465,7 @@ class NapManager:
         return data
 
     def cancel_today(self, now: datetime.datetime) -> dict:
-        data = self.ensure_plan(now.date())
+        data = self.ensure_plan(now, force=True)
         data["planned"] = False
         data["wake"] = data.get("wake") or ""
         self._write_json(self.nap_path, data)
@@ -337,7 +491,10 @@ class NapManager:
         self._write_json(self.bridge_path, bridge)
 
     def describe(self, now: datetime.datetime) -> str:
-        data = self.ensure_plan(now.date())
+        data = self.ensure_plan(now)
+        if data.get("pending"):
+            deadline = format_minute(self.sleep_deadline_min())
+            return f"今天的睡眠还没定（等手表数据上传，最晚 {deadline} 兜底）"
         if not data.get("planned"):
             return (
                 f"今日不午睡（夜间睡眠 {data.get('night_sleep_min')} 分钟，"
