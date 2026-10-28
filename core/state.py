@@ -127,6 +127,78 @@ class TimelineEntry:
 
 
 @dataclass(slots=True)
+class PeriodState:
+    """单个粗时段的生成状态。done 的时段永远不再改写。"""
+
+    status: str = "pending"  # pending / generating / done / failed
+    scheduled_at: str = ""
+    generated_at: str = ""
+    mood: str = ""
+    summary: str = ""
+    location: str = ""
+    emoji: str = ""
+    carry_over: list[str] = field(default_factory=list)
+    attempts: int = 0
+    error: str = ""
+    live_note: str = ""
+    live_note_at: str = ""
+
+    @classmethod
+    def from_dict(cls, data: dict | None) -> "PeriodState":
+        raw = data if isinstance(data, dict) else {}
+        status = str(raw.get("status", "pending")).strip().lower()
+        if status not in ("pending", "generating", "done", "failed"):
+            status = "pending"
+        carry_raw = raw.get("carry_over", [])
+        if isinstance(carry_raw, str):
+            carry_raw = [carry_raw]
+        if not isinstance(carry_raw, (list, tuple)):
+            carry_raw = []
+        carry_over = [
+            str(item).strip()[:12]
+            for item in carry_raw
+            if str(item).strip()
+        ][:2]
+        try:
+            attempts = max(0, int(raw.get("attempts", 0)))
+        except (TypeError, ValueError):
+            attempts = 0
+        return cls(
+            status=status,
+            scheduled_at=str(raw.get("scheduled_at", "")),
+            generated_at=str(raw.get("generated_at", "")),
+            mood=str(raw.get("mood", ""))[:2],
+            summary=str(raw.get("summary", "")),
+            location=str(raw.get("location", "")),
+            emoji=str(raw.get("emoji", "")),
+            carry_over=carry_over,
+            attempts=attempts,
+            error=str(raw.get("error", "")),
+            live_note=str(raw.get("live_note", ""))[:80],
+            live_note_at=str(raw.get("live_note_at", "")),
+        )
+
+    def to_dict(self) -> dict:
+        data = {
+            "status": self.status,
+            "scheduled_at": self.scheduled_at,
+            "generated_at": self.generated_at,
+            "mood": self.mood,
+            "summary": self.summary,
+            "location": self.location,
+            "emoji": self.emoji,
+            "carry_over": list(self.carry_over),
+            "attempts": self.attempts,
+        }
+        if self.live_note:
+            data["live_note"] = self.live_note
+            data["live_note_at"] = self.live_note_at
+        if self.error:
+            data["error"] = self.error
+        return data
+
+
+@dataclass(slots=True)
 class LifeState:
     date: str
     holiday: str = "无"
@@ -135,6 +207,8 @@ class LifeState:
     timeline: list[TimelineEntry] = field(default_factory=list)
     status: str = "ok"
     generated_at: str = ""
+    periods: dict[str, PeriodState] = field(default_factory=dict)
+    rolling: bool = False
 
     @classmethod
     def from_dict(cls, data: dict) -> "LifeState":
@@ -155,8 +229,17 @@ class LifeState:
             )
             if entry is not None
         ]
+        periods_raw = data.get("periods", {})
+        if not isinstance(periods_raw, dict):
+            periods_raw = {}
+        periods = {
+            str(name): PeriodState.from_dict(value)
+            for name, value in periods_raw.items()
+            if isinstance(value, dict)
+        }
+        rolling = bool(data.get("rolling", bool(periods)))
         status = str(data.get("status", "ok"))
-        if status == "ok" and not timeline:
+        if status == "ok" and not timeline and not periods:
             raise ValueError("status is ok but the timeline has no valid entries")
         return cls(
             date=date,
@@ -170,10 +253,42 @@ class LifeState:
             timeline=timeline,
             status=status,
             generated_at=str(data.get("generated_at", "")),
+            periods=periods,
+            rolling=rolling,
         )
 
+    def rebuild_timeline(self) -> None:
+        """按 done 时段重建 timeline；未完成时段不进入时间线。"""
+        if not self.periods:
+            return
+        entries: list[TimelineEntry] = []
+        for name in NATURAL_SLOT_NAMES:
+            period = self.periods.get(name)
+            if period is None or period.status != "done" or not period.summary:
+                continue
+            extra = {
+                "mood": period.mood,
+                "emoji": period.emoji,
+                "location": period.location,
+            }
+            entries.append(
+                TimelineEntry(
+                    time=name,
+                    schedule=period.summary,
+                    extra_fields=extra,
+                )
+            )
+        self.timeline = entries
+        if entries and all(
+            self.periods.get(name) and self.periods[name].status == "done"
+            for name in NATURAL_SLOT_NAMES
+        ):
+            self.status = "ok"
+        else:
+            self.status = "partial"
+
     def to_dict(self) -> dict:
-        return {
+        data = {
             "date": self.date,
             "holiday": self.holiday,
             "schedule_summary": self.schedule_summary,
@@ -181,7 +296,14 @@ class LifeState:
             "timeline": [entry.to_dict() for entry in self.timeline],
             "status": self.status,
             "generated_at": self.generated_at,
+            "rolling": self.rolling,
         }
+        if self.periods:
+            data["periods"] = {
+                name: period.to_dict()
+                for name, period in self.periods.items()
+            }
+        return data
 
 
 @dataclass(frozen=True, slots=True)
@@ -289,7 +411,7 @@ class DataManager:
             if (
                 state is None
                 or state.date != file_date.isoformat()
-                or state.status != "ok"
+                or state.status not in ("ok", "partial")
             ):
                 continue
             states.append(state)
@@ -351,9 +473,37 @@ class DataManager:
             raw = json.loads(path.read_text(encoding="utf-8-sig"))
             if not isinstance(raw, dict):
                 return None
-            return LifeState.from_dict(raw)
+            state = LifeState.from_dict(raw)
+            DataManager._migrate_legacy_state(state)
+            return state
         except Exception:
             return None
+
+    @staticmethod
+    def _migrate_legacy_state(state: LifeState) -> None:
+        """把旧版整天 timeline 迁移成时段表；已有 periods 的不动。"""
+        if state.periods or not state.timeline:
+            return
+        periods: dict[str, PeriodState] = {}
+        for entry in state.timeline:
+            name = period_for_entry(entry)
+            if not name or name in periods:
+                continue
+            periods[name] = PeriodState(
+                status="done",
+                scheduled_at=entry.time,
+                generated_at=state.generated_at,
+                mood=entry.extra_fields.get("mood", ""),
+                summary=entry.schedule,
+                location=entry.extra_fields.get("location", ""),
+                emoji=entry.extra_fields.get("emoji", ""),
+                attempts=1,
+            )
+        if not periods:
+            return
+        state.periods = periods
+        state.rolling = True
+        state.rebuild_timeline()
 
     def _backup_legacy_storage(self) -> None:
         needs_backup = self._path.exists() and self._load_path(self._path) is None
@@ -552,20 +702,66 @@ def natural_slots(
 ) -> dict[str, tuple[tuple[int, int], ...]]:
     """按日程窗口生成粗时段区间表（左闭右开）。"""
     start, end = resolve_window(window)
+
+    def clip(begin: int, finish: int) -> tuple[int, int]:
+        return max(start, begin), min(end, finish)
+
     return {
-        "上午": ((start, 12 * 60),),
-        "中午": ((12 * 60, 14 * 60),),
-        "下午": ((14 * 60, 18 * 60),),
-        "晚上": ((18 * 60, end),),
+        "上午": (clip(start, 12 * 60),),
+        "中午": (clip(12 * 60, 14 * 60),),
+        "下午": (clip(14 * 60, 18 * 60),),
+        "晚上": (clip(18 * 60, end),),
     }
 
 
-def is_minute_in_timeline_window(
+def period_names(window: tuple[int, int] | None = None) -> list[str]:
+    """当前窗口内有效的时段名，按自然顺序返回。"""
+    slots = natural_slots(window)
+    return [
+        name
+        for name in NATURAL_SLOT_NAMES
+        if name in slots and slots[name][0][0] < slots[name][0][1]
+    ]
+
+
+def period_range(
+    name: str, window: tuple[int, int] | None = None
+) -> tuple[int, int] | None:
+    """返回时段区间（起点, 终点），未知时段返回 None。"""
+    ranges = natural_slots(window).get(name)
+    if not ranges:
+        return None
+    return ranges[0]
+
+
+def period_start_minute(
+    name: str, window: tuple[int, int] | None = None
+) -> int | None:
+    value = period_range(name, window)
+    return value[0] if value else None
+
+
+def period_for_minute(
     minute: int, window: tuple[int, int] | None = None
-) -> bool:
-    """判断某分钟是否落在日程窗口内（window 为 (起点, 终点) 分钟对）。"""
-    start, end = resolve_window(window)
-    return start <= minute < end
+) -> str | None:
+    """把当天分钟落到粗时段名；窗口外返回 None。"""
+    for name in period_names(window):
+        value = period_range(name, window)
+        if value and value[0] <= minute < value[1]:
+            return name
+    return None
+
+
+def period_for_entry(
+    entry: TimelineEntry, window: tuple[int, int] | None = None
+) -> str | None:
+    """把旧时间线条目归入粗时段。"""
+    if entry.time in period_names(window):
+        return entry.time
+    minute = entry_start_minute(entry, window)
+    if minute is None:
+        return None
+    return period_for_minute(minute, window)
 
 
 def _slot_raw_ranges(

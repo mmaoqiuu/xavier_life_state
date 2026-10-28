@@ -124,6 +124,53 @@
       "在干嘛"
     ]
   },
+  "chat_schedule_edit_enable": {
+    "type": "bool",
+    "description": "启用聊天改行程",
+    "hint": "开启后，角色听到今天明确的约定时，可以改自己还没发生的行程；关闭后工具和候选提示都不生效。",
+    "default": true
+  },
+  "chat_schedule_edit_max_per_day": {
+    "type": "int",
+    "description": "每天最多改行程次数",
+    "hint": "按生活日统计，0 表示不限制。管理员 /life set 不受此限制。",
+    "default": 6
+  },
+  "chat_schedule_edit_min_interval": {
+    "type": "int",
+    "description": "两次改行程最小间隔（秒）",
+    "hint": "防止连续快速修改；0 表示不限制。",
+    "default": 15
+  },
+  "chat_schedule_edit_keywords": {
+    "type": "list",
+    "description": "改行程候选关键词",
+    "hint": "只有消息命中这些词时才追加「可能改行程」的临时提示；不直接决定是否修改。",
+    "items": {
+      "type": "string"
+    },
+    "default": [
+      "一起",
+      "约",
+      "见面",
+      "来找",
+      "等你",
+      "等我",
+      "今晚",
+      "晚上",
+      "中午",
+      "下午",
+      "上午",
+      "明天",
+      "改",
+      "取消",
+      "不去了",
+      "推迟",
+      "提前",
+      "加班",
+      "出门"
+    ]
+  },
   "day_start": {
     "type": "string",
     "description": "生活日起点",

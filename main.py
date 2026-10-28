@@ -37,6 +37,8 @@ from .core.state import (
     minute_of_day,
     mood_emoji,
     parse_clock_time,
+    period_for_minute,
+    period_range,
     select_current_slot,
     timeline_window_from_config,
 )
@@ -61,10 +63,16 @@ class DynamicLifeStatePlugin(Star):
         self.state_file = self.data_dir / "life_state.json"
         self.weather = WeatherService(self.config, self.data_dir)
         self.nap = NapManager(self.data_dir, self.config)
+        self._chat_edit_day = ""
+        self._chat_edit_count = 0
+        self._chat_edit_last_at = 0.0
+        self._chat_edit_recent: dict[str, float] = {}
 
     async def initialize(self) -> None:
         self.data_mgr = DataManager(self.state_file)
-        self.generator = Generator(self.context, self.config, self.data_mgr)
+        self.generator = Generator(
+            self.context, self.config, self.data_mgr, self.data_dir
+        )
         try:
             await self.weather.initialize()
         except Exception:
@@ -125,7 +133,7 @@ class DynamicLifeStatePlugin(Star):
     ) -> tuple[LifeState | None, datetime.date]:
         target_date = self._current_date(now)
         state = self.data_mgr.get_current(target_date.isoformat())
-        if state is None or state.status != "ok":
+        if state is None:
             return None, target_date
         return state, target_date
 
@@ -149,6 +157,12 @@ class DynamicLifeStatePlugin(Star):
                 id="dynamic_life_state_daily",
             )
             self._scheduler.add_job(
+                self._period_tick,
+                "interval",
+                minutes=5,
+                id="dynamic_life_state_period_tick",
+            )
+            self._scheduler.add_job(
                 self._nap_settle,
                 "interval",
                 minutes=10,
@@ -170,31 +184,36 @@ class DynamicLifeStatePlugin(Star):
             pass
 
     async def _startup_catch_up(self) -> None:
-        """启动后若当天状态缺失，补生成一次，避免长时间没有新状态。"""
+        """启动后补齐已经到点但还没生成的时段。"""
         try:
             await asyncio.sleep(3)
             now = self._now()
-            data, target_date = self._select_current_state(now)
-            if data is not None:
-                return
-            if self.generator.is_generating:
-                return
-            logger.info(
-                f"[DynamicLifeState] Startup catch-up generation for {target_date}"
-            )
-            await self.generator.generate(target_date)
+            logger.info("[DynamicLifeState] 启动补生成检查")
+            await self.generator.generate_due(now)
         except asyncio.CancelledError:
             raise
         except Exception:
             logger.exception("[DynamicLifeState] Startup catch-up failed")
 
     async def _daily_generate(self) -> None:
+        """跨天时只建立空白时段表，具体内容到点再生成。"""
         now = self._now()
-        data, target_date = self._select_current_state(now)
-        if data:
-            logger.info(f"[DynamicLifeState] State for {target_date} exists; skip")
+        target_date = self._current_date(now)
+        try:
+            self.generator.ensure_day(target_date, now)
+        except Exception:
+            logger.exception("[DynamicLifeState] 建立今日时段表失败")
+
+    async def _period_tick(self) -> None:
+        """每 5 分钟检查一次：只补已经到点的时段。"""
+        if self.generator.is_generating:
             return
-        await self.generator.generate(target_date)
+        try:
+            await self.generator.generate_due(self._now())
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("[DynamicLifeState] 时段自动生成失败")
 
     async def _nap_settle(self) -> None:
         """定时把已经过了终点的午睡结算掉，顺便把数据桥刷到当天。"""
@@ -219,22 +238,42 @@ class DynamicLifeStatePlugin(Star):
             now = self._now()
             if self._handle_nap(req, event, now):
                 return
+            self._append_schedule_edit_hint(req, event.message_str)
             if not self._should_inject(event.message_str):
                 return
 
             data, target_date = self._select_current_state(now)
             if data is None:
-                if self.generator.is_generating:
-                    return
-                result = await self.generator.generate(target_date)
-                if not result.succeeded or result.state is None:
-                    return
-                data = result.state
+                data = self.generator.ensure_day(target_date, now)
 
             window = self._window()
-            current_match = select_current_slot(
-                data.timeline, minute_of_day(now), window
-            )
+            current_name = period_for_minute(minute_of_day(now), window)
+            current_period = data.periods.get(current_name) if current_name else None
+            if (
+                current_period is not None
+                and current_period.status != "done"
+                and self.generator.period_is_started(
+                    target_date.isoformat(), current_name, now
+                )
+                and not self.generator.is_generating
+            ):
+                result = await self.generator.generate_period(
+                    target_date, current_name, now=now
+                )
+                if result.state is not None:
+                    data = result.state
+
+            current_match = None
+            if current_name and data.periods:
+                period = data.periods.get(current_name)
+                if period is not None and period.status == "done":
+                    current_match = select_current_slot(
+                        data.timeline, minute_of_day(now), window
+                    )
+            elif data.timeline:
+                current_match = select_current_slot(
+                    data.timeline, minute_of_day(now), window
+                )
 
             injection_method = str(
                 self.config.get("injection_mode", "extra_user_content_parts")
@@ -293,6 +332,48 @@ class DynamicLifeStatePlugin(Star):
             TextPart(text=hosting_text).mark_as_temp()
         )
         return True
+
+    def _append_schedule_edit_hint(
+        self, req: ProviderRequest, message_str: str
+    ) -> None:
+        """命中约定类关键词时，给主模型一条临时提示。"""
+        if not bool(self.config.get("chat_schedule_edit_enable", True)):
+            return
+        if not self._is_schedule_candidate(message_str):
+            return
+        hint = (
+            "<schedule_edit_hint>\n"
+            "这句话可能在改变今天的安排。若对方确实和你说定了今天某个时段的事，"
+            "请调用 update_life_schedule 改你自己的行程；只是随口聊天或不确定就不要调用。"
+            "改完不要主动说「我改行程了」，正常接话即可。\n"
+            "</schedule_edit_hint>"
+        )
+        req.extra_user_content_parts.append(
+            TextPart(text=hint).mark_as_temp()
+        )
+
+    def _is_schedule_candidate(self, message_str: str) -> bool:
+        raw = self.config.get(
+            "chat_schedule_edit_keywords",
+            [
+                "一起", "约", "见面", "来找", "等你", "等我",
+                "今晚", "晚上", "中午", "下午", "上午", "明天",
+                "改", "取消", "不去了", "推迟", "提前", "加班", "出门",
+            ],
+        )
+        if isinstance(raw, str):
+            raw = [raw]
+        elif not isinstance(raw, (list, tuple)):
+            raw = []
+        keywords = [
+            str(item).strip().casefold()
+            for item in raw
+            if str(item).strip()
+        ]
+        if not keywords:
+            return False
+        text = str(message_str or "").casefold()
+        return any(keyword in text for keyword in keywords)
 
     # ===== Session =====
 
@@ -393,10 +474,217 @@ class DynamicLifeStatePlugin(Star):
         )
         return self._format_full_state(data, weather_line=weather_line)
 
+    @filter.llm_tool(name="update_life_schedule")
+    async def update_life_schedule(
+        self,
+        event: AstrMessageEvent,
+        period: str,
+        description: str,
+        mode: str = "replace",
+    ) -> str:
+        """修改沈星回今天某个时段的行程。
+
+        period 只能是 上午 / 中午 / 下午 / 晚上。
+        description 是 10~30 字的行程描述，replace 和 cancel 都必填。
+        mode 为 replace（改安排）或 cancel（取消原安排，并写清取消后这个时段做什么）。
+        只在对方明确和你约定了今天某个时段的事时调用；随口聊天不要调用。
+        """
+        if not self._is_session_enabled(event.unified_msg_origin):
+            return "当前会话未启用动态生活状态功能。"
+        if not bool(self.config.get("chat_schedule_edit_enable", True)):
+            return "聊天改行程功能未开启。"
+        if self.generator.is_generating:
+            return "生活状态正在生成中，请稍后再试。"
+        try:
+            ok, message = self._apply_schedule_edit(
+                period,
+                description,
+                mode,
+                now=self._now(),
+                enforce_limits=True,
+            )
+        except Exception:
+            logger.exception("[DynamicLifeState] update_life_schedule failed")
+            return "改行程失败，请稍后再试。"
+        return message if ok else f"没有改成：{message}"
+
+    def _apply_schedule_edit(
+        self,
+        period: str,
+        description: str,
+        mode: str,
+        *,
+        now: datetime.datetime,
+        enforce_limits: bool,
+    ) -> tuple[bool, str]:
+        """把一句话写进今天的某个时段；返回 (是否成功, 说明)。"""
+        period = str(period or "").strip()
+        if period not in NATURAL_SLOT_NAMES:
+            return False, "时段只能是上午、中午、下午、晚上。"
+
+        mode = str(mode or "replace").strip().lower()
+        if mode in ("cancel", "取消"):
+            mode = "cancel"
+        else:
+            mode = "replace"
+
+        desc = self._clean_schedule_text(description)
+        if mode == "cancel" and not desc:
+            desc = "对方取消了，在家待着"
+            logger.warning(
+                "[DynamicLifeState] cancel 模式缺少 description，使用兜底文案"
+            )
+        if not desc:
+            return False, "行程描述不能为空。"
+        if mode == "cancel" and len(desc) < 8:
+            desc = f"对方取消了，{desc}"
+        if len(desc) > 32:
+            desc = desc[:32].rstrip("，。,.；; ")
+        if len(desc) < 8:
+            return False, "行程描述太短了，请写清楚这个时段做什么（8~32 字）。"
+
+        if self._contains_food(desc):
+            if mode == "cancel":
+                desc = "对方取消了，在家待着"
+            else:
+                desc = "和对方一起吃饭，其余时间照常"
+
+        bounds = period_range(period, self._window())
+        if bounds is None:
+            return False, "当前日程窗口里没有这个时段。"
+        start, end = bounds
+        now_minute = minute_of_day(now)
+        if now_minute >= end:
+            return False, f"{period}已经过去了，不能改。"
+
+        target_date = self._current_date(now)
+        state = self.data_mgr.get_current(target_date.isoformat())
+        if state is None:
+            state = self.generator.ensure_day(target_date, now)
+        period_state = state.periods.get(period)
+        if period_state is None:
+            return False, f"今天的{period}还没有建立，请稍后再试。"
+
+        if enforce_limits:
+            limit_error = self._check_chat_edit_limits(
+                now, target_date, period, desc
+            )
+            if limit_error:
+                return False, limit_error
+
+        started = start <= now_minute < end
+        live_changed = started and period_state.status == "done"
+        if live_changed:
+            if period_state.live_note == desc:
+                return False, "这个时段已经改成这个安排了。"
+            period_state.live_note = desc
+            period_state.live_note_at = now.isoformat()
+        else:
+            period_state.summary = desc
+            period_state.status = "done"
+            period_state.generated_at = now.isoformat()
+            period_state.live_note = ""
+            period_state.live_note_at = ""
+            period_state.carry_over.clear()
+            period_state.error = ""
+            if not period_state.mood:
+                period_state.mood = "平静"
+            if not period_state.location:
+                period_state.location = "不明"
+            if not period_state.emoji:
+                period_state.emoji = "✨"
+
+        state.rebuild_timeline()
+        self.data_mgr.set(state)
+        if enforce_limits:
+            self._record_chat_edit(now, period, desc)
+
+        if live_changed:
+            return True, f"已记下{period}的临时变动：{desc}"
+        if mode == "cancel":
+            return True, f"已取消{period}的原安排，改成：{desc}"
+        return True, f"已更新{period}的行程：{desc}"
+
+    def _check_chat_edit_limits(
+        self,
+        now: datetime.datetime,
+        target_date: datetime.date,
+        period: str,
+        desc: str,
+    ) -> str | None:
+        day_key = target_date.isoformat()
+        if self._chat_edit_day != day_key:
+            self._chat_edit_day = day_key
+            self._chat_edit_count = 0
+            self._chat_edit_recent.clear()
+
+        try:
+            max_per_day = int(self.config.get("chat_schedule_edit_max_per_day", 6))
+        except (TypeError, ValueError):
+            max_per_day = 6
+        if max_per_day > 0 and self._chat_edit_count >= max_per_day:
+            return f"今天改行程的次数已经用完了（最多 {max_per_day} 次）。"
+
+        try:
+            min_interval = float(
+                self.config.get("chat_schedule_edit_min_interval", 15)
+            )
+        except (TypeError, ValueError):
+            min_interval = 15
+        stamp = now.timestamp()
+        if (
+            min_interval > 0
+            and self._chat_edit_last_at
+            and stamp - self._chat_edit_last_at < min_interval
+        ):
+            wait = max(1, int(min_interval - (stamp - self._chat_edit_last_at)))
+            return f"改得太频繁了，请等 {wait} 秒再试。"
+
+        recent_key = f"{period}|{desc}"
+        last = self._chat_edit_recent.get(recent_key)
+        if last is not None and stamp - last < 1800:
+            return "这个时段刚刚已经改成一样的内容了。"
+        return None
+
+    def _record_chat_edit(
+        self, now: datetime.datetime, period: str, desc: str
+    ) -> None:
+        self._chat_edit_count += 1
+        self._chat_edit_last_at = now.timestamp()
+        self._chat_edit_recent[f"{period}|{desc}"] = now.timestamp()
+        cutoff = now.timestamp() - 1800
+        self._chat_edit_recent = {
+            key: value
+            for key, value in self._chat_edit_recent.items()
+            if value >= cutoff
+        }
+
+    @staticmethod
+    def _clean_schedule_text(raw: str) -> str:
+        text = str(raw or "").strip()
+        text = re.sub(r"[\r\n]+", "，", text)
+        text = re.sub(r"\s+", " ", text)
+        text = text.replace("用户说", "").replace("用户", "")
+        text = text.replace("聊天里", "").replace("聊天中", "")
+        text = re.sub(r"^[\s，,。；;：:]+|[\s，,。；;：:]+$", "", text)
+        text = re.sub(r"[，,。；;、]{2,}", "，", text)
+        return text.strip(" \t\"'“”‘’")
+
+    @staticmethod
+    def _contains_food(text: str) -> bool:
+        foods = (
+            "火锅", "烧烤", "奶茶", "咖啡", "蛋糕", "甜点", "水果",
+            "饮料", "米饭", "面条", "饺子", "包子", "零食", "汉堡",
+            "披萨", "炸鸡", "粥",
+        )
+        return any(item in text for item in foods)
+
     # ===== Formatting =====
 
     @staticmethod
-    def _format_timeline_entry(entry: TimelineEntry, enabled: dict) -> str:
+    def _format_timeline_entry(
+        entry: TimelineEntry, enabled: dict, live_note: str = ""
+    ) -> str:
         """渲染单条时间线：[时段] emoji 心情 | 描述。"""
         time_label = (entry.time or "").strip()
         mood = entry.extra_fields.get("mood", "").strip()
@@ -414,6 +702,8 @@ class DynamicLifeStatePlugin(Star):
         ]
         if others:
             line += " " + " ".join(others)
+        if live_note:
+            line += f"（临时变动：{live_note}）"
         return line
 
     @staticmethod
@@ -434,13 +724,21 @@ class DynamicLifeStatePlugin(Star):
         *,
         weather_line: str | None = None,
         footer: str = "",
+        state: LifeState | None = None,
     ) -> str:
         """渲染当前时段：天气 + 条目 + 可选脚注。"""
         lines: list[str] = []
         if weather_line:
             lines.append(weather_line)
         enabled = get_enabled_fields(self.config)
-        lines.append(self._format_timeline_entry(match.entry, enabled))
+        live_note = ""
+        if state is not None:
+            period = state.periods.get(match.entry.time)
+            if period is not None:
+                live_note = period.live_note
+        lines.append(
+            self._format_timeline_entry(match.entry, enabled, live_note)
+        )
         if footer:
             lines.append(footer)
         return "\n".join(lines)
@@ -461,7 +759,11 @@ class DynamicLifeStatePlugin(Star):
         )
         enabled = get_enabled_fields(self.config)
         for entry in entries_in_window(state.timeline, self._window()):
-            lines.append(self._format_timeline_entry(entry, enabled))
+            period = state.periods.get(entry.time)
+            live_note = period.live_note if period is not None else ""
+            lines.append(
+                self._format_timeline_entry(entry, enabled, live_note)
+            )
         return "\n".join(lines)
 
     async def _weather_line_for(
@@ -501,6 +803,60 @@ class DynamicLifeStatePlugin(Star):
             return
         yield event.plain_result(self.nap.describe(now))
 
+    @life.command("set")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def life_set(
+        self, event: AstrMessageEvent
+    ) -> AsyncGenerator[object, None]:
+        extra = _extract_args_after(event.message_str, "life set")
+        if not extra:
+            yield event.plain_result(
+                "用法：/life set <时段> <内容>\n"
+                "示例：/life set 晚上 和对方约好一起看电影"
+            )
+            return
+        period, _, description = extra.partition(" ")
+        period = period.strip()
+        description = description.strip()
+        if period not in NATURAL_SLOT_NAMES:
+            yield event.plain_result(
+                "时段只能是：上午、中午、下午、晚上。"
+            )
+            return
+        if not description:
+            yield event.plain_result("请补上这个时段要做什么。")
+            return
+        if self.generator.is_generating:
+            yield event.plain_result("状态正在生成中，请稍后再试。")
+            return
+        now = self._now()
+        try:
+            ok, message = self._apply_schedule_edit(
+                period,
+                description,
+                "replace",
+                now=now,
+                enforce_limits=False,
+            )
+        except Exception:
+            logger.exception("[DynamicLifeState] /life set failed")
+            yield event.plain_result("改行程失败，请稍后再试。")
+            return
+        if not ok:
+            yield event.plain_result(message)
+            return
+        target_date = self._current_date(now)
+        data = self.data_mgr.get_current(target_date.isoformat())
+        if data is None:
+            yield event.plain_result(message)
+            return
+        weather_line = await self._weather_line_for(target_date, now)
+        yield event.plain_result(
+            message + "\n\n" + self._format_full_state(
+                data, weather_line=weather_line
+            )
+        )
+
     @life.command("state")
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def life_state(
@@ -530,31 +886,42 @@ class DynamicLifeStatePlugin(Star):
 
         data, target_date = self._select_current_state(now)
         if data is None:
-            yield event.plain_result("今天的状态尚未生成，正在生成...")
-            result = await self.generator.generate(target_date)
-            if not result.succeeded or result.state is None:
-                if result.auto_retries_exhausted:
-                    yield event.plain_result(
-                        "今日自动生成次数已达上限，请使用 /life new 重试。"
-                    )
-                else:
-                    yield event.plain_result("状态生成失败，请稍后再试。")
-                return
-            data = result.state
-
-        if not data.timeline:
-            yield event.plain_result("没有可用的时段状态。")
-            return
+            data = self.generator.ensure_day(target_date, now)
 
         window = self._window()
+        current_name = period_for_minute(minute_of_day(now), window)
+        current_period = data.periods.get(current_name) if current_name else None
+        if (
+            current_period is not None
+            and current_period.status != "done"
+            and self.generator.period_is_started(
+                target_date.isoformat(), current_name, now
+            )
+            and not self.generator.is_generating
+        ):
+            result = await self.generator.generate_period(
+                target_date, current_name, now=now
+            )
+            if result.state is not None:
+                data = result.state
+                current_period = data.periods.get(current_name)
+
         window_footer = self._window_footer(now)
 
         if not time_query:
-            match = select_current_slot(
-                data.timeline, minute_of_day(now), window
+            if current_period is not None and current_period.status != "done":
+                yield event.plain_result(
+                    f"当前时段（{current_name}）还没有生成好，"
+                    "请稍后再试；已经过去的时段不会受影响。"
+                )
+                return
+            match = (
+                select_current_slot(data.timeline, minute_of_day(now), window)
+                if current_period is not None
+                else None
             )
             if match is None:
-                yield event.plain_result(window_footer or "没有可用的时段状态。")
+                yield event.plain_result(window_footer or "当前没有可用的时段状态。")
                 return
             weather_line = await self._weather_line_for(target_date, now)
             yield event.plain_result(
@@ -562,6 +929,7 @@ class DynamicLifeStatePlugin(Star):
                     match,
                     weather_line=weather_line,
                     footer=window_footer,
+                    state=data,
                 )
             )
             return
@@ -577,6 +945,7 @@ class DynamicLifeStatePlugin(Star):
                     match,
                     weather_line=weather_line,
                     footer=window_footer,
+                    state=data,
                 )
             )
             return
@@ -592,6 +961,7 @@ class DynamicLifeStatePlugin(Star):
                 match,
                 weather_line=weather_line,
                 footer=window_footer,
+                state=data,
             )
         )
 
@@ -625,20 +995,7 @@ class DynamicLifeStatePlugin(Star):
 
         data, target_date = self._select_current_state(now)
         if data is None:
-            if self.generator.is_generating:
-                yield event.plain_result("状态正在生成中，请稍后再试。")
-                return
-            yield event.plain_result("今天的状态尚未生成，正在生成...")
-            result = await self.generator.generate(target_date)
-            if not result.succeeded or result.state is None:
-                if result.auto_retries_exhausted:
-                    yield event.plain_result(
-                        "今日自动生成次数已达上限，请使用 /life new 重试。"
-                    )
-                else:
-                    yield event.plain_result("当前暂无有效状态。")
-                return
-            data = result.state
+            data = self.generator.ensure_day(target_date, now)
 
         weather_line = await self._weather_line_for(target_date, now)
         yield event.plain_result(
@@ -673,18 +1030,17 @@ class DynamicLifeStatePlugin(Star):
 
         extra = _extract_args_after(event.message_str, command)
         now = self._now()
-        _, target_date = self._select_current_state(now)
+        target_date = self._current_date(now)
+        self.generator.ensure_day(target_date, now)
         lock_minute = minute_of_day(now)
         lock_text = format_clock(lock_minute)
 
         if extra:
             yield event.plain_result(
-                f"正在根据附加要求重新生成 {lock_text} 之后的安排：{extra}"
+                f"正在按附加要求重试当前时段：{extra}"
             )
         else:
-            yield event.plain_result(
-                f"正在重新生成今日安排（{lock_text} 之前已经发生的时段保持不变）..."
-            )
+            yield event.plain_result("正在重试当前尚未生成的时段...")
 
         result = await self.generator.generate(
             target_date,
@@ -696,7 +1052,8 @@ class DynamicLifeStatePlugin(Star):
         if result.skipped and result.state is not None:
             weather_line = await self._weather_line_for(target_date, now)
             yield event.plain_result(
-                "今天的时间段都已经开始了，没有可以重新生成的部分。\n\n"
+                "当前时段已经生成，done 的时段不会被改写。\n"
+                "要改今天的内容，请等下一个时段，或先手动删除当天数据。\n\n"
                 f"{self._format_full_state(result.state, weather_line=weather_line)}"
             )
             return
@@ -709,11 +1066,12 @@ class DynamicLifeStatePlugin(Star):
                     f"{self._format_full_state(result.state, weather_line=weather_line)}"
                 )
             else:
-                yield event.plain_result("状态生成失败，请稍后再试。")
+                yield event.plain_result("当前时段生成失败，请稍后再试。")
             return
 
         weather_line = await self._weather_line_for(target_date, now)
+        period_text = f"{result.period} " if result.period else ""
         yield event.plain_result(
-            f"重新生成完成，{lock_text} 之前的时段保持不变。\n\n"
+            f"{period_text}时段重新生成完成；今天其他已完成的时段保持不变。\n\n"
             f"{self._format_full_state(result.state, weather_line=weather_line)}"
         )
